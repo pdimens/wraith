@@ -1,0 +1,21 @@
+### Wrath-plus Config example
+
+# base settings 
+sample_table: "config/samples.tsv" #input sample table is tab-separated format (sample\tgroup\tbam)
+genome_fasta: "Heliconius_erato_demophoon_v1_-_scaffolds.fa.gz" # path to reference genome fasta
+wrath_scripts: "/home/ari22/wrath-plus/sv_detection" # path to Wrath scripts (typically sv_detection)
+outdir: "snakemake_wrath_out" # output directory
+
+chroms: "config/chroms.txt" # path to chrom list
+window_size: 10000 # window size in bp 
+threads: 8 # total number of threads to assign 
+auto_detect_svs: True # T/F if you want Wrath to auto-call SV's
+plot: True # T/F if you want Wrath to plot matrices
+
+# population comparisons and chrom subsetting
+two_pop_comparison: True # T/F if you want Wrath to plot two population matrices
+regions: # (Optional) - bed file containing regions to subset chromosomes for analysis
+
+# outlier detection settings
+zscore_threshold: 2 # Z score threshold 
+prediction_level: 0.95 # prediction band quantile

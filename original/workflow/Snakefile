@@ -1,0 +1,376 @@
+# Snakefile: Wrath-plus
+import os
+import pandas as pd
+import warnings
+from itertools import chain
+from itertools import combinations
+
+# -----------------------------
+# CONFIG & PARAMETERS
+# -----------------------------
+
+configfile: "config/config.yaml"
+
+samples = pd.read_csv(
+    config["sample_table"],
+    sep='\t'
+)
+
+samples["bam"] = samples["bam"].apply(
+    lambda b: os.path.abspath(b) if not os.path.isabs(b) else b
+)
+
+# define chroms from chromlist
+with open(config["chroms"]) as f:
+    chroms = [line.strip() for line in f if line.strip()]
+
+outdir = config["outdir"]
+
+groups = sorted(samples["group"].unique())
+
+winsize = config["window_size"]
+
+group_of_sample = samples.set_index("sample")["group"].to_dict()
+
+sample_bam = samples.set_index("sample")["bam"].to_dict()
+
+sample_dict = samples.groupby('group')['bam'].apply(list).to_dict()
+
+group_samples = samples.groupby('group')['sample'].apply(list).to_dict()
+
+# handle optional regions input and generate suffix for output files if provided
+regions = config.get("regions", None)
+region_tag = os.path.splitext(os.path.basename(regions))[0] if regions else None
+region_suffix = f"_{region_tag}" if region_tag else ""
+
+# conditionally generate regions dataframe if regions are provided, otherwise set to None for downstream rules
+if regions:
+    regions_df = pd.read_csv(regions, sep='\t', header=None, names=['chrom', 'start', 'end'])
+
+# define a function to generate window paths for downstream rules, incorporating chrom and optional region suffix
+def window_path(chrom):
+    return f"{outdir}/beds/windows_{winsize}_{chrom}{region_suffix}.bed"
+
+# function for defining the region argument for samtools view in get_barcodes_per_sample rule, checking if regions are provided 
+# and if the current chrom has a matching region, otherwise defaulting to whole chrom
+def get_samtools_region(wc):
+    if not regions:
+        return wc.chrom
+    match = regions_df[regions_df['chrom'] == wc.chrom]
+    if match.empty:
+        return wc.chrom
+    return f"{wc.chrom}:{match['start'].iloc[0]}-{match['end'].iloc[0]}"
+
+# --- Input validation ---
+
+# Raise warning if bams are found in multiple groups
+
+## simple uniqueness check
+def uniqueness_check(data_dict):
+    all_values = chain.from_iterable(data_dict.values())
+    seen_values = set()
+    for value in all_values:
+        if value in seen_values:
+            return False
+        seen_values.add(value)
+    return True
+
+## issue warning
+if not uniqueness_check(sample_dict):
+        warnings.warn(
+            "BAM was assigned to multiple groups in sample table - please check if this was intended behavior.", 
+            UserWarning
+        )
+
+
+
+
+# check for duplicate sample + group combos
+if not samples.set_index(['sample', 'group']).index.is_unique:
+    dupes = samples[samples.duplicated(subset=['sample', 'group'], keep=False)]
+    raise ValueError(
+        f"Duplicate (sample, group) combinations found in sample sheet.\n"
+        f"The duplicates are:\n{dupes.to_string(index=False)}"
+    )
+
+# validation check
+if config.get("two_pop_comparison", False):
+    if len(groups) < 2:
+        raise ValueError(
+            f"two_pop_comparison is enabled but only {len(groups)} group found. "
+            "At least 2 groups are required."
+        )
+
+# for two pop comparisons, generate a list of paired groups for two-way comparisons
+pairs = list(combinations(groups, 2))
+
+# define targets based on config
+
+def get_targets():
+    targets = []
+    # ... conditionally append to targets ...
+    targets += expand(
+    "{outdir}/matrices/jaccard_matrix_{winsize}_{chrom}_{group}.txt",
+    outdir=outdir, winsize=winsize, chrom=chroms, group=groups
+    )
+        
+    if config.get("plot", False):
+        targets += expand(
+            "{outdir}/plots/heatmap_{winsize}_{chrom}_{group}.png",
+            outdir=outdir, winsize=winsize, chrom=chroms, group=groups
+            )  # heatmaps
+    
+    if config.get("auto_detect_svs", False):
+        targets += expand(
+            "{outdir}/SVs/sv_{winsize}_{chrom}_{group}.txt",
+            outdir=outdir, winsize=winsize, chrom=chroms, group=groups
+            )  # SV files
+    
+    if config.get("auto_detect_svs", False) and config.get("plot", False):
+        targets += expand(
+            f"{outdir}/plots/heatmap_{winsize}_{{chrom}}_{{group}}_svs.png",
+            chrom=chroms, group=groups
+        )  # SV heatmaps
+
+    if config.get("two_pop_comparison", False):
+        targets += [
+            f"{outdir}/plots/heatmap_{winsize}_{chrom}_{g1}_vs_{g2}.png"
+            for chrom in chroms
+            for g1, g2 in pairs
+        ]  # pair-wise plots, list comprehension over pairs
+
+    return targets
+
+
+#### ----------------WORKFLOW--------------------- #####
+
+ruleorder: sv_detection_and_heatmap > sv_detection_noplot
+
+rule all:
+    input: get_targets()
+
+rule index_genome:
+    input:
+        fasta = config["genome_fasta"]
+    output:
+        fai = config["genome_fasta"] + ".fai"
+    conda:
+        "envs/wrath_py.yaml"
+    shell:
+        "samtools faidx {input.fasta}"
+
+rule chrom_sizes:
+    input:
+        fai = config["genome_fasta"] + ".fai"
+    output:
+        chrom_sizes = outdir + "/genome.sizes"
+    conda:
+        "envs/wrath_py.yaml"
+    shell:
+        "cut -f1,2 {input.fai} > {output.chrom_sizes}"
+
+rule make_windows:
+    input:
+        regions_or_sizes = lambda wc: regions if regions else f"{outdir}/genome.sizes"
+    output:
+        windows = window_path("{chrom}")
+    wildcard_constraints:
+        chrom = "|".join(chroms) # constrain wildcards to chroms defined in chroms.txt
+    params:
+        makewindows_cmd = lambda wc: (
+        f"grep -w {wc.chrom} {regions if regions else f'{outdir}/genome.sizes'}"
+        f" | bedtools makewindows -{'b' if regions else 'g'} - -w {winsize}"
+        )
+    conda:
+        "envs/wrath_py.yaml"
+    shell:
+        """
+        {params.makewindows_cmd} >  {output.windows}
+        """
+
+rule get_barcodes_per_sample:
+    input:
+        sample = lambda wc: sample_bam[wc.sample]
+    wildcard_constraints:
+        sample = "|".join(sample_bam.keys()), # constrain sample wildcard to samples in sample table
+        chrom = "|".join(chroms) # constrain chrom wildcard to chroms defined in chroms.txt
+    threads: config["threads"]
+    output:
+        bed = temp(f"{outdir}/beds/barcodes_{{sample}}_{{chrom}}.bed")
+    params:
+        samtools_region = get_samtools_region
+    conda: "envs/wrath_py.yaml"
+    shell:
+        """
+        samtools view -q 20 -@ {threads} {input.sample} {params.samtools_region} |
+        grep -o -P "{wildcards.chrom}.*BX:Z:[^\\t\\n]*" |
+        awk '{{print $1"\t"$2"\t"$2"\t"$NF}}' > {output.bed}
+        """
+
+rule merge_barcodes:
+    input:
+        beds = lambda wc: expand(
+        "{outdir}/beds/barcodes_{sample}_{chrom}.bed",
+        outdir=outdir,
+        sample=group_samples[wc.group],
+        chrom=wc.chrom
+        )
+    output:
+        merged_bed = temp(f"{outdir}/beds/merged_barcodes_{{group}}_{{chrom}}.bed.gz"),
+        merged_index = temp(f"{outdir}/beds/merged_barcodes_{{group}}_{{chrom}}.bed.gz.tbi")
+    wildcard_constraints:
+        group = "|".join(groups),
+        chrom = "|".join(chroms)
+    threads: config["threads"]
+    log: f"{outdir}/logs/merge_barcodes/merge_barcodes_{winsize}_{{chrom}}_{{group}}.log"
+    conda: "envs/wrath_py.yaml"
+    shell:
+        """
+        cat {input.beds} | bedtools sort -i - | bgzip -@ {threads} > {output.merged_bed}
+        tabix {output.merged_bed} 2> {log}
+        """
+
+rule jaccard_matrix:
+    input:
+        windows = window_path("{chrom}"),
+        barcodes = f"{outdir}/beds/merged_barcodes_{{group}}_{{chrom}}.bed.gz",
+        index    = f"{outdir}/beds/merged_barcodes_{{group}}_{{chrom}}.bed.gz.tbi"
+    output:
+        jaccard_matrix = f"{outdir}/matrices/jaccard_matrix_{winsize}_{{chrom}}_{{group}}.txt"
+    wildcard_constraints:
+        group = "|".join(groups),
+        chrom = "|".join(chroms)
+    threads: config["threads"]
+    log:
+        f"{outdir}/logs/jaccard_matrix/jaccard_matrix_{winsize}_{{chrom}}_{{group}}.log"
+    params:
+        script = config["wrath_scripts"] + "/jaccard_matrix_simplequeue.py"
+    conda: "envs/wrath_py.yaml"
+    shell:
+        """
+         python {params.script} \
+        --threads {threads} \
+        -w {input.windows} \
+        -b {input.barcodes} \
+        -o {output.jaccard_matrix} 2> {log}
+
+        sed -i 's/,$//' {output.jaccard_matrix}
+        """
+
+rule plot_heatmap:
+    input:
+        windows = window_path("{chrom}"),
+        jaccard_matrix = f"{outdir}/matrices/jaccard_matrix_{winsize}_{{chrom}}_{{group}}.txt"
+    output:
+        heatmap = f"{outdir}/plots/heatmap_{winsize}_{{chrom}}_{{group}}.png"
+    wildcard_constraints:
+        group = "|".join(groups),
+        chrom = "|".join(chroms)
+    params:
+        script = config["wrath_scripts"] + "/plot_heatmap.py"
+    conda: "envs/wrath_py.yaml"
+    shell:
+        """
+        python {params.script} \
+        --matrix {input.jaccard_matrix} \
+        -w {input.windows} \
+        -o {output.heatmap}
+        """
+
+rule detect_outliers:
+    input:
+        jaccard_matrix = f"{outdir}/matrices/jaccard_matrix_{winsize}_{{chrom}}_{{group}}.txt"
+    output:
+        csv = f"{outdir}/outliers/outliers_{winsize}_{{chrom}}_{{group}}.csv",
+        plot = f"{outdir}/outliers/outliers_{winsize}_{{chrom}}_{{group}}_plot.png"
+    wildcard_constraints:
+        group = "|".join(groups),
+        chrom = "|".join(chroms)
+    log: f"{outdir}/logs/detect_outliers/detect_outliers_{winsize}_{{chrom}}_{{group}}.log"
+    params:
+        script = config["wrath_scripts"] + "/outlier_detection.R",
+        zscore_threshold = config.get("zscore_threshold", 2),
+        prediction_level = config.get("prediction_level", 0.95),
+        prefix = f"{outdir}/outliers/outliers_{winsize}_{{chrom}}_{{group}}"
+    conda: "envs/wrath_r.yaml"
+    shell:
+        """
+        Rscript {params.script} \
+        {input.jaccard_matrix} \
+        {params.prefix} \
+        {params.zscore_threshold} \
+        {params.prediction_level} 2> {log}
+        """
+
+rule sv_detection_and_heatmap:
+    input:
+        windows = window_path("{chrom}"),
+        outliers = f"{outdir}/outliers/outliers_{winsize}_{{chrom}}_{{group}}.csv",
+        jaccard_matrix = f"{outdir}/matrices/jaccard_matrix_{winsize}_{{chrom}}_{{group}}.txt"
+    output:
+        sv_file = f"{outdir}/SVs/sv_{winsize}_{{chrom}}_{{group}}.txt",
+        sv_heatmap = f"{outdir}/plots/heatmap_{winsize}_{{chrom}}_{{group}}_svs.png"
+    wildcard_constraints:
+        group = "|".join(groups),
+        chrom = "|".join(chroms)
+    params:
+        script = config["wrath_scripts"] + "/sv_detection_and_heatmap.py",
+        winsize = winsize
+    conda: "envs/wrath_py.yaml"
+    shell:
+        """
+        python {params.script} \
+        --matrix {input.jaccard_matrix} \
+        -w {input.windows} \
+        -o {input.outliers} \
+        -p {output.sv_heatmap} \
+        -s {output.sv_file} \
+        -f {params.winsize} \
+        -c {wildcards.chrom} 
+        """
+
+rule sv_detection_noplot:
+    input:
+        outliers = f"{outdir}/outliers/outliers_{winsize}_{{chrom}}_{{group}}.csv",
+        jaccard_matrix = f"{outdir}/matrices/jaccard_matrix_{winsize}_{{chrom}}_{{group}}.txt"
+    output:
+        sv_file = f"{outdir}/SVs/sv_{winsize}_{{chrom}}_{{group}}.txt"
+    wildcard_constraints:
+        group = "|".join(groups),
+        chrom = "|".join(chroms)
+    params:
+        script = config["wrath_scripts"] + "/sv_detection.py",
+        winsize = winsize
+    conda: "envs/wrath_py.yaml"
+    shell:
+        """
+        python {params.script} \
+        --matrix {input.jaccard_matrix} \
+        -o {input.outliers} \
+        -s {output.sv_file} \
+        -f {params.winsize} \
+        -c {wildcards.chrom} 
+        """
+
+rule two_pop_comparison:
+    input:
+        windows = window_path("{chrom}"),
+        jaccard_matrix_g1 = f"{outdir}/matrices/jaccard_matrix_{winsize}_{{chrom}}_{{g1}}.txt",
+        jaccard_matrix_g2 = f"{outdir}/matrices/jaccard_matrix_{winsize}_{{chrom}}_{{g2}}.txt"
+    output:
+        heatmap = f"{outdir}/plots/heatmap_{winsize}_{{chrom}}_{{g1}}_vs_{{g2}}.png"
+    wildcard_constraints:
+        g1 = "|".join(groups),
+        g2 = "|".join(groups),
+        chrom = "|".join(chroms)
+    params:
+        script = config["wrath_scripts"] + "/plot_2matrices_together.py"
+    conda: "envs/wrath_py.yaml"
+    shell:
+        """
+        python {params.script} \
+        --matrix1 {input.jaccard_matrix_g1} \
+        --matrix2 {input.jaccard_matrix_g2} \
+        -w {input.windows} \
+        -o {output.heatmap}
+        """
