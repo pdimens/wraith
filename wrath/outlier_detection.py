@@ -12,6 +12,7 @@ from scipy.stats import t as t_dist
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import seaborn as sns
 
 def model(x, a, b, c):
     with np.errstate(over="ignore"):
@@ -71,14 +72,15 @@ def main(argv):
     )
 
     # plot
+    sns.set_theme(style="white")
     fig, ax = plt.subplots(figsize=(6, 3.5))
-    ax.scatter(df["x"], df["y"], s=8, color="black")
+    sns.scatterplot(x=df["x"], y=df["y"], s=8, color="black", ax=ax)
     order = np.argsort(xv)
     ax.plot(xv[order], fitted[order], color="blue")
     ax.fill_between(xv[order], df["Qbottom"].to_numpy()[order], df["Qtop"].to_numpy()[order],
                      color="purple", alpha=0.3)
     out_df = df.filter(pl.col("is_outlier"))
-    ax.scatter(out_df["x"], out_df["y"], color="#FF6600")
+    sns.scatterplot(x=out_df["x"], y=out_df["y"], color="#FF6600", ax=ax)
     ax.set_xlabel("Distance from matrix")
     ax.set_ylabel("Similarity index")
     ax.set_title(f"{pred_level * 100:g}% prediction bands")

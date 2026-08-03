@@ -1,2 +1,10 @@
 *.bam
 *.bam.bai
+
+.pixi*
+pixi.lock
+
+*.egg*
+*.pyc
+*.bed
+wrath_out/
