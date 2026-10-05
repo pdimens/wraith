@@ -1,6 +1,7 @@
 using WraithSV
 using Test
 using LinearAlgebra, LsqFit, Distributions
+import Mmap
 
 # deterministic pseudo-noise in [-0.5, 0.5) so tests need no extra dependencies
 noise(i, j) = mod(sin(12.9898i + 78.233j) * 43758.5453, 1.0) - 0.5
@@ -94,5 +95,74 @@ end
         @test all((i, j) in flagged for i in 10:12, j in 40:42)
         @test all(res.outliers.is_upper .| res.outliers.is_lower)
         @test all(abs.(res.outliers.z_score) .> 2.0)
+    end
+
+    @testset "PackedTriangle" begin
+        n = 37
+        mat = synthetic(n)
+        p = packTriangle(mat)
+        @test p isa PackedTriangle
+        @test length(p.data) == packedlength(n) == n * (n - 1) ÷ 2
+        @test size(p) == (n, n)
+
+        # indexing: column-major packing, zeros on/below the diagonal
+        k = 0
+        for j in 2:n, i in 1:j-1
+            k += 1
+            @test p.data[k] == mat[i, j]
+            @test p[i, j] == mat[i, j]
+        end
+        @test all(p[i, i] == 0f0 for i in 1:n)
+        @test all(p[j, i] == 0f0 for j in 2:n, i in 1:j-1)
+        @test_throws ArgumentError (p[5, 3] = 1f0)
+        @test_throws BoundsError p[0, 1]
+        @test unpack(p) == mat
+
+        # downstream functions give the same answer on packed and dense input
+        @test diagonalStats(p).μ ≈ diagonalStats(mat).μ
+        zp = jaccardScores(p)
+        @test zp isa PackedTriangle
+        @test unpack(zp) ≈ jaccardScores(mat)
+        rd = detectOutliers(mat)
+        rp = detectOutliers(p)
+        @test rp.params ≈ rd.params
+        @test rp.outliers.nrow == rd.outliers.nrow && rp.outliers.ncol == rd.outliers.ncol
+
+        mktempdir() do dir
+            # compressed round trip, in memory and memory-mapped
+            f = joinpath(dir, "tri.wpt")
+            @test writePacked(f, p) == f
+            @test filesize(f) < 4length(p.data)   # smooth synthetic data compresses
+            @test unpack(readPacked(f)) == mat
+            q = readPacked(f; mmap=true, mmap_path=joinpath(dir, "q.bin"))
+            @test q.mapped
+            @test unpack(q) == mat
+
+            # construct directly into a memory-mapped file, flush, re-open it
+            raw = joinpath(dir, "raw.bin")
+            m = packTriangle(mat; mmap=true, path=raw)
+            @test m.mapped
+            @test unpack(m) == mat
+            Mmap.sync!(m)
+            @test filesize(raw) == 4length(p.data)
+            @test unpack(openMapped(raw, n; readonly=true)) == mat
+            @test_throws ArgumentError openMapped(raw, n + 1)
+
+            # temp-file mmap (no path)
+            t = packTriangle(mat; mmap=true)
+            @test t.mapped && unpack(t) == mat
+
+            # malformed files
+            bad = joinpath(dir, "bad.wpt")
+            write(bad, "not a packed file")
+            @test_throws ArgumentError readPacked(bad)
+            trunc = joinpath(dir, "trunc.wpt")
+            write(trunc, read(f, filesize(f) - 20))
+            @test_throws Exception readPacked(trunc)
+        end
+
+        # degenerate sizes
+        @test length(PackedTriangle(0).data) == 0
+        @test length(PackedTriangle(1; mmap=true).data) == 0
     end
 end
