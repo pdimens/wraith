@@ -1,4 +1,4 @@
-using Statistics, LsqFit, Distributions, LinearAlgebra, StaticArrays
+using Statistics, LsqFit, Distributions, LinearAlgebra
 
 
 """
@@ -28,31 +28,81 @@ that traverses the diagonal of Matrix `A`
 """
 diagonal(A, col::Int) = (A[i, col+i] for i in 1:size(A, 1)-1)
 
+# ---------------------------------------------------------------------------
+# Everything downstream of the Jaccard matrix depends only on the distance `d`
+# from the diagonal, never on the individual cell. A matrix with `n` windows has
+# n(n-1)/2 cells but only n-1 distinct distances, so all fitting and band
+# calculations below work on O(n) per-diagonal summaries instead of O(n²) cells.
+# ---------------------------------------------------------------------------
+
 """
-Using the Jaccard identity matrix (intersect/union) as input,
-calculate the Z-scores. Returns a Z score matrix.
+Per-diagonal summary of the upper triangle of an `n × n` matrix. Every vector
+has length `n-1` and is indexed by the distance `d = j - i` from the diagonal.
+
+- `μ[d]`: mean of diagonal `d`
+- `ss[d]`: within-diagonal sum of squares, `Σ(y - μ[d])²`
+- `k[d]`: number of cells on diagonal `d` (`n - d`)
 """
-function jaccardScores(mat::Matrix{Float32})::Matrix{Float64}
+struct DiagonalStats
+    n::Int
+    μ::Vector{Float64}
+    ss::Vector{Float64}
+    k::Vector{Int}
+end
+
+"""
+    diagonalStats(mat) -> DiagonalStats
+
+Compute the mean and sum of squares of every diagonal of the upper triangle in a
+single column-major (cache-friendly) pass using O(n) extra memory. Sums are
+accumulated relative to the first element of each diagonal to avoid
+catastrophic cancellation.
+"""
+function diagonalStats(mat::AbstractMatrix{<:Real})::DiagonalStats
     n = size(mat, 1)
-    z_scores = similar(mat, axes(mat))
-    @inbounds for diag in 1:(n-1)
-        diag_start = diag + 1
-        diag_len = n - diag
-        μ = 0.0
-        for j in diag_start:n
-            μ += mat[j-diag, j]
+    size(mat, 2) == n || throw(DimensionMismatch("matrix must be square"))
+    nd = n - 1
+    shift = Vector{Float64}(undef, nd)
+    s1 = zeros(nd)
+    s2 = zeros(nd)
+    @inbounds for d in 1:nd
+        shift[d] = mat[1, 1+d]
+    end
+    @inbounds for j in 2:n
+        for i in 1:j-1
+            d = j - i
+            δ = mat[i, j] - shift[d]
+            s1[d] += δ
+            s2[d] += δ * δ
         end
-        μ /= diag_len
+    end
+    k = [n - d for d in 1:nd]
+    μ = shift .+ s1 ./ k
+    ss = max.(s2 .- s1 .^ 2 ./ k, 0.0)
+    return DiagonalStats(n, μ, ss, k)
+end
 
-        σ² = 0.0
-        for j in diag_start:n
-            σ² += (mat[j-diag, j] - μ)^2
-        end
-        σ = sqrt(σ² / (diag_len - 1))
+"""
+Per-diagonal sample standard deviation (`n-1` denominator, like R's `scale()`).
+`NaN` for the single-cell diagonal.
+"""
+diagonalSD(s::DiagonalStats) = sqrt.(s.ss ./ (s.k .- 1))
 
-        for j in diag_start:n
-            z_scores[j-diag, j] = σ == 0 ? 0.0 : (mat[j-diag, j] - μ) / σ
-        end
+@inline zscore(y, μ, σ) = σ == 0 ? 0.0 : (y - μ) / σ
+
+"""
+Using the Jaccard identity matrix (intersect/union) as input, calculate the
+Z-scores of each upper-triangle cell relative to its diagonal. Returns a
+`Float32` matrix (lower triangle and diagonal are zero). If you only need to
+flag outliers, prefer [`detectOutliers`](@ref), which never stores this matrix.
+"""
+function jaccardScores(mat::AbstractMatrix{<:Real}, stats::DiagonalStats=diagonalStats(mat))::Matrix{Float32}
+    n = stats.n
+    σ = diagonalSD(stats)
+    z_scores = zeros(Float32, n, n)
+    @inbounds for j in 2:n, i in 1:j-1
+        d = j - i
+        z_scores[i, j] = zscore(mat[i, j], stats.μ[d], σ[d])
     end
     return z_scores
 end
@@ -73,193 +123,178 @@ function jaccardScores2(mat::Matrix{Float32})::Matrix{Float64}
 end
 
 """
-Fit the model y = exp(a + b*exp(-x*c)) to (xs, ys) using nonlinear least squares.
-Returns the fitted parameter vector [a, b, c].
+    gompertz(x, a, b, c)
+
+The model `exp(a + b·exp(-c·x))`.
 """
-function fitGompertz(xs::Vector{Float64}, ys::Vector{Float64})::Vector{Float64}
-    model(x, p) = exp.(p[1] .+ p[2] .* exp.(-x .* p[3]))
-    p0 = [1.0, 1.0, 1.0]
-    fit = curve_fit(model, xs, ys, p0)
+@inline gompertz(x, a, b, c) = exp(a + b * exp(-c * x))
+
+"""
+    gompertzJacobianRow(x, a, b, c) -> (f, ∂a, ∂b, ∂c)
+
+Model value and analytic gradient at `x`:
+`∂a = f`, `∂b = f·e`, `∂c = -f·b·x·e`, where `e = exp(-c·x)`.
+"""
+@inline function gompertzJacobianRow(x, a, b, c)
+    e = exp(-c * x)
+    f = exp(a + b * e)
+    return (f, f, f * e, -f * b * x * e)
+end
+
+"""
+    fitGompertz(stats; p0=[1.0, 1.0, 1.0]) -> Vector{Float64}
+
+Fit `y = exp(a + b·exp(-x·c))` to every cell of the matrix, using only its
+[`DiagonalStats`](@ref).
+
+For a model that depends on `x` alone,
+`Σ(y - f(x))² = Σ(y - μ[d])² + k[d]·(μ[d] - f(d))²` per diagonal, and the first
+term does not depend on the parameters. The least-squares fit over all
+n(n-1)/2 cells is therefore *exactly* a fit of the n-1 diagonal means weighted
+by the diagonal lengths `k`, so the parameters match a fit on every cell while
+costing O(n) time and memory. The analytic Jacobian is supplied to avoid
+finite differences.
+"""
+function fitGompertz(stats::DiagonalStats; p0::AbstractVector{Float64}=[1.0, 1.0, 1.0])::Vector{Float64}
+    nd = length(stats.μ)
+    xs = collect(1.0:nd)
+    sw = sqrt.(Float64.(stats.k))   # weights enter the cost as sw²
+    ys = sw .* stats.μ
+    model(x, p) = [sw[i] * gompertz(x[i], p[1], p[2], p[3]) for i in eachindex(x)]
+    function jacobian(x, p)
+        J = Matrix{Float64}(undef, length(x), 3)
+        @inbounds for i in eachindex(x)
+            _, ja, jb, jc = gompertzJacobianRow(x[i], p[1], p[2], p[3])
+            J[i, 1] = sw[i] * ja
+            J[i, 2] = sw[i] * jb
+            J[i, 3] = sw[i] * jc
+        end
+        return J
+    end
+    fit = curve_fit(model, jacobian, xs, ys, collect(p0))
+    fit.converged || @warn "Gompertz fit did not converge; bands may be unreliable"
     return fit.param
 end
 
-
 """
-    predictionBands(xs, ys, params, level=0.95) -> (ŷ, lower, upper)
+    predictionBands(stats, params, level=0.95)
 
-Compute pointwise prediction bands for the Gompertz model
-`y = exp(a + b·exp(-x·c))` fitted to observations `(xs, ys)`.
+Pointwise prediction bands for the Gompertz model with parameters
+`params = [a, b, c]`, returned per diagonal (vectors of length `n-1` indexed by
+distance `d`) as a NamedTuple `(fitted, lower, upper, est_error, rss, mse, df, tcrit)`.
 
-Each band is centred on the fitted value `ŷᵢ` with half-width
-`t_{α/2, n-3} · sqrt(MSE · (1 + hᵢ))`, where:
-- `MSE = RSS / (n - 3)` is the residual mean squared error
-- `hᵢ = Jᵢᵀ (JᵀJ)⁻¹ Jᵢ` is the leverage of point `i`
-- `Jᵢ` is the analytic Jacobian row `[∂f/∂a, ∂f/∂b, ∂f/∂c]` evaluated at `xᵢ`
+Each band is `ŷ(d) ± t · sqrt(MSE · (1 + h(d)))` where
+- `MSE = RSS / (m - 3)` with `m = n(n-1)/2` cells,
+- `h(d) = J(d)ᵀ (JᵀJ)⁻¹ J(d)` is the leverage, with
+  `JᵀJ = Σ_d k[d] · J(d) J(d)ᵀ` (every cell on a diagonal shares the same Jacobian row),
+- `RSS = Σ ss[d] + Σ k[d]·(μ[d] - ŷ(d))²`.
 
-# Arguments
-- `xs::Vector{Float64}`: predictor values (diagonal distances from the matrix diagonal)
-- `ys::Vector{Float64}`: response values (Jaccard similarities)
-- `params::Vector{Float64}`: fitted parameters `[a, b, c]` from [`fitGompertz`](@ref)
-- `level::Float64`: confidence level for the prediction bands (default: `0.95`)
-
-# Returns
-A `Tuple{Vector{Float64}, Vector{Float64}, Vector{Float64}}` of equal-length vectors:
-- `ŷ`: fitted values
-- `lower`: lower prediction bound
-- `upper`: upper prediction bound
-
-# Performance notes
-All intermediate values (`Jᵢ`, `JᵀJ`, `(JᵀJ)⁻¹`) are stack-allocated via
-`StaticArrays`. The only heap allocations are the three returned output vectors.
+`h` is computed through a hand-rolled 3×3 Cholesky factorisation (`JᵀJ = LLᵀ`,
+`h = ‖L⁻¹J‖²`), which is better conditioned than forming `(JᵀJ)⁻¹` since the
+`b` and `c` columns of J are nearly collinear. No heap allocation besides the
+output vectors.
 """
-function predictionBands(
-    xs::Vector{Float64},
-    ys::Vector{Float64},
-    params::Vector{Float64},
-    level::Float64=0.95
-)::Tuple{Vector{Float64},Vector{Float64},Vector{Float64}}
+function predictionBands(stats::DiagonalStats, params::AbstractVector{Float64}, level::Float64=0.95)
+    nd = length(stats.μ)
+    nd >= 3 || throw(ArgumentError("need at least 4 windows (3 distinct diagonals) to fit 3 parameters"))
+    a, b, c = params
+    m = sum(stats.k)
+    df = m - 3
 
-    n = length(ys)
-    a, b, c = params[1], params[2], params[3]
-    α = 1.0 - level
-
-    # First pass: accumulate JᵀJ, RSS, and ŷ together
-    JtJ = @MMatrix zeros(3, 3)   # heap-allocated, but fast(er) mutable 3×3
-    rss = 0.0
-    ŷ = Vector{Float64}(undef, n)
-
-    @inbounds for i in 1:n
-        x = xs[i]
-        e = exp(-x * c)
-        fi = exp(a + b * e)         # ŷᵢ
-        ŷ[i] = fi
-
-        # Jacobian row
-        Ji = SVector{3,Float64}(fi, fi * e, fi * (-b * x * e))
-
-        # Accumulate JᵀJ in-place: rank-1 update
-        for r in 1:3, s in r:3
-            v = Ji[r] * Ji[s]
-            JtJ[r, s] += v
-            if r != s
-                JtJ[s, r] += v
-            end
-        end
-
-        r = ys[i] - fi
-        rss += r * r
+    # Pass 1: JᵀJ (upper triangle, weighted by diagonal length), fitted values, RSS
+    s11 = s12 = s13 = s22 = s23 = s33 = 0.0
+    rss = sum(stats.ss)
+    fitted = Vector{Float64}(undef, nd)
+    @inbounds for d in 1:nd
+        f, j1, j2, j3 = gompertzJacobianRow(d, a, b, c)
+        fitted[d] = f
+        w = stats.k[d]
+        s11 += w * j1 * j1
+        s12 += w * j1 * j2
+        s13 += w * j1 * j3
+        s22 += w * j2 * j2
+        s23 += w * j2 * j3
+        s33 += w * j3 * j3
+        rss += w * (stats.μ[d] - f)^2
     end
+    mse = rss / df
 
-    mse = rss / (n - 3)
-    JtJ_inv = inv(SMatrix{3,3}(JtJ))   # static 3×3 inversion, no heap alloc
-    t_crit = quantile(TDist(n - 3), 1.0 - α / 2.0)
+    # Cholesky JᵀJ = L Lᵀ
+    l11 = sqrt(s11)
+    l21 = s12 / l11
+    l31 = s13 / l11
+    p22 = s22 - l21 * l21
+    p22 > 0 || throw(ArgumentError("JᵀJ is not positive definite; check the fitted parameters"))
+    l22 = sqrt(p22)
+    l32 = (s23 - l31 * l21) / l22
+    p33 = s33 - l31 * l31 - l32 * l32
+    p33 > 0 || throw(ArgumentError("JᵀJ is not positive definite; check the fitted parameters"))
+    l33 = sqrt(p33)
 
-    # Second pass: compute per-point leverage and bands
-    lower = Vector{Float64}(undef, n)
-    upper = Vector{Float64}(undef, n)
+    tcrit = quantile(TDist(df), 1.0 - (1.0 - level) / 2.0)
 
-    @inbounds for i in 1:n
-        x = xs[i]
-        e = exp(-x * c)
-        fi = ŷ[i]
-        Ji = SVector{3,Float64}(fi, fi * e, fi * (-b * x * e))
-
-        # hᵢ = Jᵢᵀ (JᵀJ)⁻¹ Jᵢ
-        v = JtJ_inv * Ji
-        hi = dot(Ji, v)
-        half_w = t_crit * sqrt(mse * (1.0 + hi))
-        lower[i] = fi - half_w
-        upper[i] = fi + half_w
+    # Pass 2: leverage and bands, one value per diagonal
+    lower = Vector{Float64}(undef, nd)
+    upper = Vector{Float64}(undef, nd)
+    est_error = Vector{Float64}(undef, nd)
+    @inbounds for d in 1:nd
+        f, j1, j2, j3 = gompertzJacobianRow(d, a, b, c)
+        w1 = j1 / l11
+        w2 = (j2 - l21 * w1) / l22
+        w3 = (j3 - l31 * w1 - l32 * w2) / l33
+        h = w1 * w1 + w2 * w2 + w3 * w3
+        se = sqrt(mse * (1.0 + h))
+        est_error[d] = se
+        lower[d] = f - tcrit * se
+        upper[d] = f + tcrit * se
     end
-
-    return (ŷ, lower, upper)
-end
-
-# this one allocates a lot, perhaps don't use it, see function above
-function predictionBands(xs::Vector{Float64}, ys::Vector{Float64}, params::Vector{Float64}, level::Float64=0.95)::Tuple{Vector{Float64},Vector{Float64},Vector{Float64}}
-    model(x, p) = exp.(p[1] .+ p[2] .* exp.(-x .* p[3]))
-
-    n = length(ys)
-    p = length(params)
-    ŷ = model(xs, params)
-
-    # Residual mean squared error
-    residuals = ys .- ŷ
-    mse = dot(residuals, residuals) / (n - p)
-
-    # Jacobian of the model at each point: shape (n × p)
-    # ∂/∂a = exp(a + b*exp(-xc))          = ŷ
-    # ∂/∂b = exp(a + b*exp(-xc))*exp(-xc) = ŷ .* exp.(-xs.*params[3])
-    # ∂/∂c = exp(a + b*exp(-xc))*(-b*x*exp(-xc)) = ŷ .* (-params[2] .* xs .* exp.(-xs.*params[3]))
-    e = exp.(-xs .* params[3])
-    J = hcat(ŷ, ŷ .* e, ŷ .* (-params[2] .* xs .* e))   # n × 3
-
-    # (JᵀJ)⁻¹  — small 3×3 matrix, direct inversion is fine
-    JtJ_inv = inv(J' * J)
-
-    # Leverage scores: hᵢ = Jᵢᵀ (JᵀJ)⁻¹ Jᵢ  (one scalar per point)
-    leverage = [dot(J[i, :], JtJ_inv * J[i, :]) for i in 1:n]
-
-    # Prediction std: sqrt(MSE * (1 + hᵢ))
-    pred_std = sqrt.(mse .* (1.0 .+ leverage))
-
-    # Two-sided t critical value
-    α = 1.0 - level
-    t_crit = quantile(TDist(n - p), 1.0 - α / 2.0)
-
-    @inbounds begin
-        lower = ŷ .- t_crit .* pred_std
-        upper = ŷ .+ t_crit .* pred_std
-    end
-    return (ŷ, lower, upper)
+    return (; fitted, lower, upper, est_error, rss, mse, df, tcrit)
 end
 
 """
-Given the Jaccard matrix, return a NamedTuple of flat vectors ready for
-outlier detection, mirroring the R `dataset` dataframe.
+    findOutliers(mat, stats, bands; zthreshold=2.0)
 
-Fields: nrow, ncol, diag_dist, value, z_score, abs_z, fitted, lower, upper
+Stream over the upper triangle and keep only cells that are outside the
+prediction bands of their diagonal **and** have `|z| > zthreshold` (the WRATH
+criterion). Nothing proportional to n² is allocated beyond the (small) result.
+
+Returns a NamedTuple of equal-length vectors:
+`(nrow, ncol, x, value, z_score, fitted, lower, upper, est_error, is_upper, is_lower)`.
+`NaN` cells are never flagged.
 """
-function buildOutlierDataset(
-    mat::Matrix{Float32},
-    z_scores::Matrix{Float64},
-    prediction_level::Float64=0.95
-)
-    n = size(mat, 1)
-    m = n * (n - 1) ÷ 2
-
-    # pre-allocate output vectors because we know what the size will be based on the input matrix
-    rows = Vector{Int}(undef, m)
-    cols = Vector{Int}(undef, m)
-    dists = Vector{Int}(undef, m)
-    values = Vector{Float64}(undef, m)
-    zs = Vector{Float64}(undef, m)
-
-    k = 0
-    @inbounds for j in 1:n, i in 1:(j-1)
-        k += 1
-        rows[k] = i
-        cols[k] = j
-        dists[k] = j - i
-        values[k] = mat[i, j]
-        zs[k] = z_scores[i, j]
+function findOutliers(mat::AbstractMatrix{<:Real}, stats::DiagonalStats, bands; zthreshold::Float64=2.0)
+    n = stats.n
+    σ = diagonalSD(stats)
+    out = (nrow=Int[], ncol=Int[], x=Int[], value=Float64[], z_score=Float64[],
+        fitted=Float64[], lower=Float64[], upper=Float64[], est_error=Float64[],
+        is_upper=Bool[], is_lower=Bool[])
+    @inbounds for j in 2:n, i in 1:j-1
+        d = j - i
+        y = Float64(mat[i, j])
+        up = y > bands.upper[d]
+        lo = y < bands.lower[d]
+        (up || lo) || continue
+        z = zscore(y, stats.μ[d], σ[d])
+        abs(z) > zthreshold || continue
+        push!(out.nrow, i); push!(out.ncol, j); push!(out.x, d)
+        push!(out.value, y); push!(out.z_score, z)
+        push!(out.fitted, bands.fitted[d]); push!(out.lower, bands.lower[d])
+        push!(out.upper, bands.upper[d]); push!(out.est_error, bands.est_error[d])
+        push!(out.is_upper, up); push!(out.is_lower, lo)
     end
+    return out
+end
 
-    xs = Float64.(dists)
-    ys = values
+"""
+    detectOutliers(mat; level=0.95, zthreshold=2.0) -> (outliers, bands, params)
 
-    params = fitGompertz(xs, ys)
-    ŷ, lower, upper = predictionBands(xs, ys, params, prediction_level)
-
-    return (
-        nrow=rows,
-        ncol=cols,
-        x=dists,
-        y=values,
-        z_score=zs,
-        abs_z=abs.(zs),
-        fitted=ŷ,
-        lower=lower,
-        upper=upper,
-    )
+End-to-end WRATH outlier detection on a Jaccard matrix: per-diagonal statistics,
+Gompertz fit, prediction bands, then a streaming scan for outliers. Peak extra
+memory is O(n) plus the outliers themselves, instead of O(n²).
+"""
+function detectOutliers(mat::AbstractMatrix{<:Real}; level::Float64=0.95, zthreshold::Float64=2.0)
+    stats = diagonalStats(mat)
+    params = fitGompertz(stats)
+    bands = predictionBands(stats, params, level)
+    return (outliers=findOutliers(mat, stats, bands; zthreshold), bands=bands, params=params)
 end
