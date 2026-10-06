@@ -2,7 +2,7 @@
 
 julia_version = "1.12.6"
 manifest_format = "2.0"
-project_hash = "9f85f150000b01319b421465c423735e52992b19"
+project_hash = "5ee8de24c7199ff565624516719af13047dd9e62"
 
 [[deps.ADTypes]]
 git-tree-sha1 = "f7304359109c768cf32dc5fa2d371565bb63b68a"
@@ -102,10 +102,9 @@ uuid = "00701ae9-d1dc-5365-b64a-a3a3ebf5695e"
 version = "3.1.0"
 
 [[deps.BioGenerics]]
-deps = ["TranscodingStreams"]
-git-tree-sha1 = "017562e86afcd2a6a2a9220606a40b54604887c9"
+git-tree-sha1 = "80732d9b249133009a152fc311a07fb553544195"
 uuid = "47718e42-2ac5-11e9-14af-e5595289c2ea"
-version = "0.1.5"
+version = "0.1.6"
 
 [[deps.BioSequences]]
 deps = ["BioSymbols", "PrecompileTools", "Random", "Twiddle"]
@@ -657,7 +656,7 @@ version = "1.11.0"
 deps = ["CodecZlib", "Distributions", "LinearAlgebra", "LsqFit", "Mmap", "Statistics", "XAM"]
 path = "."
 uuid = "da1843e0-e922-40ae-9840-cb4a5d8973b4"
-version = "1.0.0-DEV"
+version = "0.1.0-DEV"
 
 [[deps.XAM]]
 deps = ["Automa", "BGZFStreams", "BioAlignments", "BioGenerics", "BioSequences", "GenomicFeatures", "Indexes", "Printf", "TranscodingStreams"]

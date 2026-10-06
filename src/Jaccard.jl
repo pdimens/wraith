@@ -227,7 +227,7 @@ end
     findOutliers(mat, stats, bands; zthreshold=2.0)
 
 Stream over the upper triangle and keep only cells that are outside the
-prediction bands of their diagonal **and** have `|z| > zthreshold` (the WRATH
+prediction bands of their diagonal **and** have `|z| > zthreshold` (the WraithSV
 criterion). Nothing proportional to n² is allocated beyond the (small) result.
 
 Returns a NamedTuple of equal-length vectors:
@@ -260,7 +260,7 @@ end
 """
     detectOutliers(mat; level=0.95, zthreshold=2.0) -> (outliers, bands, params)
 
-End-to-end WRATH outlier detection on a Jaccard matrix: per-diagonal statistics,
+End-to-end WraithSV outlier detection on a Jaccard matrix: per-diagonal statistics,
 Gompertz fit, prediction bands, then a streaming scan for outliers. Peak extra
 memory is O(n) plus the outliers themselves, instead of O(n²).
 """

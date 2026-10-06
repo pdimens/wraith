@@ -1,4 +1,8 @@
 using WraithSV
+using WraithSV: jaccardIdent, jaccardScores, DiagonalStats, diagonalStats, diagonalSD,
+    gompertz, gompertzJacobianRow, fitGompertz, predictionBands, findOutliers,
+    detectOutliers, PackedTriangle, packedlength, packTriangle, unpack,
+    writePacked, readPacked, openMapped, detectSVs, writeSVs
 using Test
 using LinearAlgebra, LsqFit, Distributions
 import Mmap

@@ -74,7 +74,7 @@ end
 
 Group the outliers returned by [`findOutliers`](@ref) (or `detectOutliers(...).outliers`;
 only its `nrow` and `ncol` are used) into putative structural variants, a port of
-WRATH's `sv_detection.py`. Outlier cells closer than `distance` windows are
+the original WRATH `sv_detection.py`. Outlier cells closer than `distance` windows are
 clustered (single linkage), and each cluster gives one SV spanning
 `minrow … maxcol`, so `length = maxcol - minrow` windows. `winsize` converts
 window indices to base pairs for `start`, `stop` and `length`.

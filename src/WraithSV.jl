@@ -6,16 +6,13 @@ include("DetectSV.jl")
 include("BAM.jl")
 include("Windows.jl")
 
-export jaccardIdent, jaccardScores, DiagonalStats, diagonalStats, diagonalSD,
-    gompertz, gompertzJacobianRow, fitGompertz, predictionBands, findOutliers,
-    detectOutliers, PackedTriangle, packedlength, packTriangle, unpack,
-    writePacked, readPacked, openMapped, detectSVs, writeSVs, wrath
+export wraithsv
 
 """
     wraithsv(bams, genome, chromosome; winsize=50_000, start=nothing, stop=nothing,
-          outdir="wrath_out", threads=1, detect=false, plot=true, step=nothing)
+             outdir="wraithsv_out", threads=1, detect=false, plot=true, step=nothing)
 
-Entry point for the whole WRATH workflow, the Julia counterpart of the `wrath`
+Entry point for the whole WraithSV workflow, the Julia counterpart of the original WRATH `wrath`
 bash script: build a barcode-sharing (Jaccard) matrix between genomic windows of
 one chromosome, optionally flag outliers and call SVs from it.
 
