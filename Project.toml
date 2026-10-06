@@ -1,6 +1,6 @@
 name = "WraithSV"
 uuid = "da1843e0-e922-40ae-9840-cb4a5d8973b4"
-version = "1.0.0-DEV"
+version = "0.1.0-DEV"
 authors = ["pdimens <pdimens@gmail.com> and contributors"]
 
 [deps]
