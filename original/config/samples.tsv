@@ -1,5 +1,0 @@
-sample	group	bam
-SLVR_01	all	/path/to/SLVR_01.bam
-SLVR_02	inv	/path/to/SLVR_02.bam
-SLVR_03	inv	/path/to/SLVR_03.bam
-SLVR_04	het	/path/to/SLVR_04.bam

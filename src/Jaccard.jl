@@ -11,23 +11,6 @@ function jaccardIdent(x::Set{String}, y::Set{String})::Float64
     return _intersect / _union
 end
 
-"""
-Return a generator traversing an upper triangle, omitting the diagonal.
-Returns (i,j) indices, intended to be used as:
-```
-for (i,j) in uppertriangle(mat)
-        ...
-    end
-```
-"""
-uppertriangle(A) = ((i, j) for j in axes(A, 2) for i in 1:j-1)
-
-"""
-Given a column index `col` to start, creates a generator
-that traverses the diagonal of Matrix `A`
-"""
-diagonal(A, col::Int) = (A[i, col+i] for i in 1:size(A, 1)-1)
-
 # ---------------------------------------------------------------------------
 # Everything downstream of the Jaccard matrix depends only on the distance `d`
 # from the diagonal, never on the individual cell. A matrix with `n` windows has
@@ -41,7 +24,7 @@ has length `n-1` and is indexed by the distance `d = j - i` from the diagonal.
 
 - `μ[d]`: mean of diagonal `d`
 - `ss[d]`: within-diagonal sum of squares, `Σ(y - μ[d])²`
-- `k[d]`: number of cells on diagonal `d` (`n - d`)
+- `k[d]`: number of finite cells on diagonal `d` (`n - d` when none are missing)
 """
 struct DiagonalStats
     n::Int
@@ -54,41 +37,43 @@ end
     diagonalStats(mat) -> DiagonalStats
 
 Compute the mean and sum of squares of every diagonal of the upper triangle in a
-single column-major (cache-friendly) pass using O(n) extra memory. Sums are
-accumulated relative to the first element of each diagonal to avoid
-catastrophic cancellation.
+single column-major (cache-friendly) pass using O(n) extra memory. Non-finite
+cells (`NaN`, `±Inf`) are skipped, so `k[d]` counts only the finite cells of
+diagonal `d` and `μ[d]` is `NaN` when none are left. Sums are accumulated
+relative to the first finite element of each diagonal to avoid catastrophic
+cancellation.
 """
 function diagonalStats(mat::AbstractMatrix{<:Real})::DiagonalStats
     n = size(mat, 1)
     size(mat, 2) == n || throw(DimensionMismatch("matrix must be square"))
-    nd = n - 1
-    shift = Vector{Float64}(undef, nd)
+    nd = max(n - 1, 0)
+    shift = zeros(nd)
     s1 = zeros(nd)
     s2 = zeros(nd)
-    @inbounds for d in 1:nd
-        shift[d] = mat[1, 1+d]
+    k = zeros(Int, nd)
+    @inbounds for j in 2:n, i in 1:j-1
+        v = Float64(mat[i, j])
+        isfinite(v) || continue
+        d = j - i
+        k[d] == 0 && (shift[d] = v)
+        k[d] += 1
+        δ = v - shift[d]
+        s1[d] += δ
+        s2[d] += δ * δ
     end
-    @inbounds for j in 2:n
-        for i in 1:j-1
-            d = j - i
-            δ = mat[i, j] - shift[d]
-            s1[d] += δ
-            s2[d] += δ * δ
-        end
-    end
-    k = [n - d for d in 1:nd]
-    μ = shift .+ s1 ./ k
-    ss = max.(s2 .- s1 .^ 2 ./ k, 0.0)
+    μ = [k[d] > 0 ? shift[d] + s1[d] / k[d] : NaN for d in 1:nd]
+    ss = [k[d] > 0 ? max(s2[d] - s1[d]^2 / k[d], 0.0) : 0.0 for d in 1:nd]
     return DiagonalStats(n, μ, ss, k)
 end
 
 """
 Per-diagonal sample standard deviation (`n-1` denominator, like R's `scale()`).
-`NaN` for the single-cell diagonal.
+`NaN` for diagonals with fewer than two finite cells.
 """
 diagonalSD(s::DiagonalStats) = sqrt.(s.ss ./ (s.k .- 1))
 
-@inline zscore(y, μ, σ) = σ == 0 ? 0.0 : (y - μ) / σ
+# σ is NaN for diagonals with < 2 finite cells; treat those like σ == 0
+@inline zscore(y, μ, σ) = σ > 0 ? (y - μ) / σ : 0.0
 
 """
 Using the Jaccard identity matrix (intersect/union) as input, calculate the
@@ -103,21 +88,6 @@ function jaccardScores(mat::AbstractMatrix{<:Real}, stats::DiagonalStats=diagona
     @inbounds for j in 2:n, i in 1:j-1
         d = j - i
         z_scores[i, j] = zscore(mat[i, j], stats.μ[d], σ[d])
-    end
-    return z_scores
-end
-
-# Much less code, about the same speed, significantly more allocations
-function jaccardScores2(mat::Matrix{Float32})::Matrix{Float64}
-    z_scores = similar(mat, axes(mat))
-    @inbounds for col in 1:(size(mat, 1)-1)
-        idx = diagind(mat, col)
-        diag = @view mat[idx]
-        μ = mean(diag)
-        σ = stdm(diag, μ)
-        for i in idx
-            z_scores[i] = σ == 0 ? 0.0 : (mat[i] - μ) / σ
-        end
     end
     return z_scores
 end
@@ -156,10 +126,11 @@ costing O(n) time and memory. The analytic Jacobian is supplied to avoid
 finite differences.
 """
 function fitGompertz(stats::DiagonalStats; p0::AbstractVector{Float64}=[1.0, 1.0, 1.0])::Vector{Float64}
-    nd = length(stats.μ)
-    xs = collect(1.0:nd)
-    sw = sqrt.(Float64.(stats.k))   # weights enter the cost as sw²
-    ys = sw .* stats.μ
+    idx = findall(>(0), stats.k)    # diagonals with no finite cells carry no information
+    length(idx) >= 3 || throw(ArgumentError("need at least 3 diagonals with finite values to fit 3 parameters"))
+    xs = Float64.(idx)
+    sw = sqrt.(Float64.(stats.k[idx]))   # weights enter the cost as sw²
+    ys = sw .* stats.μ[idx]
     model(x, p) = [sw[i] * gompertz(x[i], p[1], p[2], p[3]) for i in eachindex(x)]
     function jacobian(x, p)
         J = Matrix{Float64}(undef, length(x), 3)
@@ -196,7 +167,7 @@ output vectors.
 """
 function predictionBands(stats::DiagonalStats, params::AbstractVector{Float64}, level::Float64=0.95)
     nd = length(stats.μ)
-    nd >= 3 || throw(ArgumentError("need at least 4 windows (3 distinct diagonals) to fit 3 parameters"))
+    count(>(0), stats.k) >= 3 || throw(ArgumentError("need at least 3 diagonals with finite values to fit 3 parameters"))
     a, b, c = params
     m = sum(stats.k)
     df = m - 3
@@ -209,6 +180,7 @@ function predictionBands(stats::DiagonalStats, params::AbstractVector{Float64}, 
         f, j1, j2, j3 = gompertzJacobianRow(d, a, b, c)
         fitted[d] = f
         w = stats.k[d]
+        w == 0 && continue
         s11 += w * j1 * j1
         s12 += w * j1 * j2
         s13 += w * j1 * j3

@@ -1,2 +1,6 @@
 *.bam
 *.bam.bai
+*.egg-info/
+wrath_out/
+pixi.lock
+.pixi/

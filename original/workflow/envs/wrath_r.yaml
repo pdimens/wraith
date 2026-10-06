@@ -1,9 +1,0 @@
-channels:
-  - conda-forge
-  - bioconda
-dependencies:
-  - r-base
-  - r-ggplot2
-  - r-tidyr
-  - r-dplyr
-  - r-nlraa
